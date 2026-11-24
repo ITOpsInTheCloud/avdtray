@@ -1,0 +1,18 @@
+[package]
+name = "avdtray"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.77"
+description = "Lightweight FSLogix profile status tray tool - a replacement for the retired frxtray.exe"
+license = "MIT"
+build = "build.rs"
+
+# Intentionally no dependencies: plain Win32 via hand-written bindings in src/ffi.rs.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
