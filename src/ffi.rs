@@ -478,6 +478,191 @@ extern "system" {
 }
 
 
+// ================================================================ v0.2: painted UI
+
+#[repr(C)]
+pub struct PAINTSTRUCT {
+    pub hdc: HDC,
+    pub fErase: BOOL,
+    pub rcPaint: RECT,
+    pub fRestore: BOOL,
+    pub fIncUpdate: BOOL,
+    pub rgbReserved: [u8; 32],
+}
+
+#[repr(C)]
+pub struct DRAWITEMSTRUCT {
+    pub CtlType: u32,
+    pub CtlID: u32,
+    pub itemID: u32,
+    pub itemAction: u32,
+    pub itemState: u32,
+    pub hwndItem: HWND,
+    pub hDC: HDC,
+    pub rcItem: RECT,
+    pub itemData: usize,
+}
+
+#[repr(C)]
+pub struct MINMAXINFO {
+    pub ptReserved: POINT,
+    pub ptMaxSize: POINT,
+    pub ptMaxPosition: POINT,
+    pub ptMinTrackSize: POINT,
+    pub ptMaxTrackSize: POINT,
+}
+
+#[repr(C)]
+pub struct INITCOMMONCONTROLSEX {
+    pub dwSize: u32,
+    pub dwICC: u32,
+}
+
+#[repr(C)]
+pub struct LVCOLUMNW {
+    pub mask: u32,
+    pub fmt: i32,
+    pub cx: i32,
+    pub pszText: *mut u16,
+    pub cchTextMax: i32,
+    pub iSubItem: i32,
+    pub iImage: i32,
+    pub iOrder: i32,
+    pub cxMin: i32,
+    pub cxDefault: i32,
+    pub cxIdeal: i32,
+}
+
+#[repr(C)]
+pub struct LVITEMW {
+    pub mask: u32,
+    pub iItem: i32,
+    pub iSubItem: i32,
+    pub state: u32,
+    pub stateMask: u32,
+    pub pszText: *mut u16,
+    pub cchTextMax: i32,
+    pub iImage: i32,
+    pub lParam: isize,
+    pub iIndent: i32,
+    pub iGroupId: i32,
+    pub cColumns: u32,
+    pub puColumns: *mut u32,
+    pub piColFmt: *mut i32,
+    pub iGroup: i32,
+}
+
+pub const WM_PAINT: u32 = 0x000F;
+pub const WM_ERASEBKGND: u32 = 0x0014;
+pub const WM_SETTINGCHANGE: u32 = 0x001A;
+pub const WM_SETCURSOR: u32 = 0x0020;
+pub const WM_GETMINMAXINFO: u32 = 0x0024;
+pub const WM_DRAWITEM: u32 = 0x002B;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_LBUTTONDOWN: u32 = 0x0201;
+pub const WM_CTLCOLOREDIT: u32 = 0x0133;
+pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+pub const BS_OWNERDRAW: u32 = 0x000B;
+pub const ODS_SELECTED: u32 = 0x0001;
+pub const ODS_FOCUS: u32 = 0x0010;
+pub const ODS_NOFOCUSRECT: u32 = 0x0200;
+pub const VK_TAB: usize = 0x09;
+pub const VK_SHIFT: i32 = 0x10;
+pub const VK_CONTROL: i32 = 0x11;
+pub const VK_PRIOR: usize = 0x21;
+pub const VK_NEXT: usize = 0x22;
+pub const HTCLIENT: isize = 1;
+pub const IDC_HAND: usize = 32649;
+pub const SRCCOPY: u32 = 0x00CC_0020;
+
+pub const ICC_LISTVIEW_CLASSES: u32 = 0x0001;
+pub const LVS_REPORT: u32 = 0x0001;
+pub const LVS_SINGLESEL: u32 = 0x0004;
+pub const LVS_SHOWSELALWAYS: u32 = 0x0008;
+pub const LVS_NOSORTHEADER: u32 = 0x8000;
+pub const LVS_EX_FULLROWSELECT: isize = 0x0020;
+pub const LVS_EX_DOUBLEBUFFER: isize = 0x0001_0000;
+pub const LVM_SETBKCOLOR: u32 = 0x1001;
+pub const LVM_DELETEALLITEMS: u32 = 0x1009;
+pub const LVM_SETCOLUMNWIDTH: u32 = 0x101E;
+pub const LVM_SETTEXTCOLOR: u32 = 0x1024;
+pub const LVM_SETTEXTBKCOLOR: u32 = 0x1026;
+pub const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
+pub const LVM_INSERTITEMW: u32 = 0x104D;
+pub const LVM_INSERTCOLUMNW: u32 = 0x1061;
+pub const LVM_SETITEMTEXTW: u32 = 0x1074;
+pub const LVCF_WIDTH: u32 = 0x0002;
+pub const LVCF_TEXT: u32 = 0x0004;
+pub const LVCF_SUBITEM: u32 = 0x0008;
+pub const LVIF_TEXT: u32 = 0x0001;
+pub const LVSCW_AUTOSIZE_USEHEADER: isize = -2;
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
+#[link(name = "user32")]
+extern "system" {
+    pub fn BeginPaint(hwnd: HWND, ps: *mut PAINTSTRUCT) -> HDC;
+    pub fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) -> BOOL;
+    pub fn InvalidateRect(hwnd: HWND, rect: *const RECT, erase: BOOL) -> BOOL;
+    pub fn GetKeyState(vk: i32) -> i16;
+    pub fn ScreenToClient(hwnd: HWND, pt: *mut POINT) -> BOOL;
+    pub fn SetCursor(cursor: HCURSOR) -> HCURSOR;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    pub fn CreateCompatibleBitmap(hdc: HDC, w: i32, h: i32) -> HBITMAP;
+    pub fn SelectObject(hdc: HDC, obj: HGDIOBJ) -> HGDIOBJ;
+    pub fn BitBlt(dst: HDC, x: i32, y: i32, w: i32, h: i32, src: HDC, sx: i32, sy: i32, rop: u32) -> BOOL;
+    pub fn DeleteDC(hdc: HDC) -> BOOL;
+    pub fn CreateSolidBrush(color: u32) -> HBRUSH;
+    pub fn SetTextColor(hdc: HDC, color: u32) -> u32;
+    pub fn SetBkColor(hdc: HDC, color: u32) -> u32;
+}
+
+#[link(name = "comctl32")]
+extern "system" {
+    pub fn InitCommonControlsEx(icc: *const INITCOMMONCONTROLSEX) -> BOOL;
+}
+
+#[link(name = "uxtheme")]
+extern "system" {
+    pub fn SetWindowTheme(hwnd: HWND, app: *const u16, idlist: *const u16) -> i32;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    pub fn DwmSetWindowAttribute(hwnd: HWND, attr: u32, value: *const c_void, size: u32) -> i32;
+}
+
+// ---- tooltips (v0.2.1)
+#[repr(C)]
+pub struct TTTOOLINFOW {
+    pub cbSize: u32,
+    pub uFlags: u32,
+    pub hwnd: HWND,
+    pub uId: usize,
+    pub rect: RECT,
+    pub hinst: HINSTANCE,
+    pub lpszText: *mut u16,
+    pub lParam: LPARAM,
+    pub lpReserved: *mut c_void,
+}
+/// Size without lpReserved: accepted by both comctl32 v5 and v6.
+pub const TTTOOLINFOW_V2_SIZE: u32 = 64;
+pub const ICC_TAB_CLASSES: u32 = 0x0008; // includes tooltips
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+pub const TTS_ALWAYSTIP: u32 = 0x01;
+pub const TTS_NOPREFIX: u32 = 0x02;
+pub const TTF_SUBCLASS: u32 = 0x0010;
+pub const TTM_SETDELAYTIME: u32 = 0x0403;
+pub const TTM_SETMAXTIPWIDTH: u32 = 0x0418;
+pub const TTM_ADDTOOLW: u32 = 0x0432;
+pub const TTM_DELTOOLW: u32 = 0x0433;
+pub const TTDT_AUTOPOP: usize = 2;
+
 // Compile-time layout checks against the Windows x64 ABI sizes.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
@@ -490,5 +675,11 @@ const _: () = {
     assert!(size_of::<SERVICE_STATUS>() == 28);
     assert!(size_of::<VS_FIXEDFILEINFO>() == 52);
     assert!(size_of::<SYSTEMTIME>() == 16);
+    assert!(size_of::<PAINTSTRUCT>() == 72);
+    assert!(size_of::<DRAWITEMSTRUCT>() == 64);
+    assert!(size_of::<MINMAXINFO>() == 40);
+    assert!(size_of::<LVCOLUMNW>() == 56);
+    assert!(size_of::<LVITEMW>() == 88);
+    assert!(size_of::<TTTOOLINFOW>() == 72);
     assert!(HKEY_LOCAL_MACHINE as usize == 0xFFFF_FFFF_8000_0002);
 };

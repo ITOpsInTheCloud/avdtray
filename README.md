@@ -2,7 +2,7 @@
 
 A lightweight, open replacement for **frxtray.exe**, the FSLogix Profile Status tray tool that Microsoft deprecated on 22 Aug 2023 and removed from FSLogix 25.02 (retired 11 Feb 2025).
 
-* Single native `avdtray.exe` (~300–500 KB), written in Rust on the raw Win32 API
+* Single native `avdtray.exe` (~400–700 KB), written in Rust on the raw Win32 API
 * **No runtime, no VC++ redistributable, no third-party crates.** It builds offline.
 * Runs as the signed-in user (`asInvoker`), needs no admin rights, and is per-session on multi-session hosts
 * Windows 10/11, Windows Server 2016+ (x64 and ARM64)
@@ -20,12 +20,16 @@ A lightweight, open replacement for **frxtray.exe**, the FSLogix Profile Status 
 
 The tooltip shows the one-line state for each container. A notification balloon appears when the state turns red.
 
-**Status window** (left-click the icon). The text is selectable and screen-reader friendly:
-* Status / Reason / Error with plain-English meanings ([Microsoft code reference](https://learn.microsoft.com/fslogix/troubleshooting-error-codes)), with the Windows error text for `Error`
-* Every value in the user's `Sessions\<SID>` key (VHD paths, volume, etc.)
-* Container volume size, free space, file system, **read/write vs read-only**
-* State and file version of `frxsvc`, `frxccds`, `frxdrv`, `frxdrvvt`, `frxccd`
-* Paths of the newest Profile and ODFC logs
+**Status window** (left-click the icon). It's a painted, DPI-aware window that follows the Windows light/dark setting:
+* **Header cards:** computer, user, session ID and the overall status
+* **Profile Container / Office Container (ODFC) tabs:**
+  * Status, Reason and Error in plain English ([Microsoft code reference](https://learn.microsoft.com/fslogix/troubleshooting-error-codes))
+  * Session key, VHD(X) path and type, read/write vs read-only, size and file system
+  * A free/used space donut chart
+  * Values that don't fit (long session keys, UNC paths) are shortened with "…". Hover over them to see the full text in a tooltip.
+* **Session Details tab:** every value in the user's `Sessions\<SID>` keys, the state and version of each FSLogix service and driver, and the log paths
+* **Report tab:** the full plain-text report, which is the screen-reader-friendly view
+* **Keyboard:** Ctrl+Tab / Ctrl+Shift+Tab switch tabs, and Esc closes the window
 
 **Right-click menu:** Show status, Refresh, Copy report to clipboard, open the latest Profile or ODFC log, open the logs folder, open the FSLogix event log (`Microsoft-FSLogix-Apps/Operational`), run `frx.exe list-redirects`, About, Exit.
 

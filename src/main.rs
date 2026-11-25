@@ -3,19 +3,29 @@
 //! Usage: avdtray.exe [--interval <seconds>] [--show] [--no-notify]
 //! Running it a second time in the same session opens the status window of the
 //! instance that is already running.
+//!
+//! Keyboard: Ctrl+Tab / Ctrl+Shift+Tab (or Ctrl+PgDn / Ctrl+PgUp) switch tabs,
+//! Esc closes the window. The "Report" tab holds the full plain-text report,
+//! which is the screen-reader friendly view.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+#![allow(clippy::too_many_arguments)]
 
 mod ffi;
+mod gdip;
 mod icons;
 mod status;
+mod theme;
+mod view;
 mod win;
 
 use ffi::*;
+use gdip::{Graphics, RectF};
 use status::{Light, Snapshot};
 use std::cell::{Cell, RefCell};
 use std::ptr::null;
 use std::sync::Mutex;
+use theme::{colorref, Palette};
 use win::wide;
 
 const APP_NAME: &str = "AVD Tray";
@@ -33,6 +43,7 @@ const ID_REFRESH: usize = 101;
 const ID_COPY: usize = 102;
 const ID_REDIRECTS: usize = 103;
 const ID_LOG_PROFILE: usize = 104;
+const ID_LIST: usize = 105;
 const ID_CLOSE: usize = IDCANCEL; // so Esc closes the window
 const ID_SHOW: usize = 201;
 const ID_LOG_ODFC: usize = 202;
@@ -59,6 +70,7 @@ struct Options {
 struct App {
     hwnd: Cell<HWND>,
     edit: Cell<HWND>,
+    list: Cell<HWND>,
     buttons: RefCell<Vec<HWND>>,
     font_mono: Cell<HFONT>,
     font_ui: Cell<HFONT>,
@@ -71,6 +83,17 @@ struct App {
     body: RefCell<String>,
     extra: RefCell<String>,
     tip: RefCell<String>,
+    // painted UI
+    snapshot: RefCell<Option<Snapshot>>,
+    generated: RefCell<String>,
+    tab: Cell<usize>,
+    tab_rects: RefCell<Vec<RectF>>,
+    pal: Cell<Palette>,
+    ctl_brush: Cell<HBRUSH>,
+    // tooltips for cut-off values
+    tooltip: Cell<HWND>,
+    hovers: RefCell<Vec<(RectF, String)>>,
+    tool_count: Cell<usize>,
 }
 
 thread_local! {
@@ -114,6 +137,14 @@ fn main() {
             return;
         }
 
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES,
+        };
+        InitCommonControlsEx(&icc);
+        // Kept alive until the end of main. If GDI+ is unavailable the tray still works.
+        let _gdiplus = gdip::Gdiplus::start();
+
         let hinst = GetModuleHandleW(null());
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -124,7 +155,7 @@ fn main() {
             hInstance: hinst,
             hIcon: 0,
             hCursor: LoadCursorW(0, IDC_ARROW as *const u16),
-            hbrBackground: COLOR_BTNFACE + 1,
+            hbrBackground: 0, // fully painted in WM_PAINT
             lpszMenuName: null(),
             lpszClassName: class.as_ptr(),
             hIconSm: 0,
@@ -135,6 +166,7 @@ fn main() {
         APP.with(|a| {
             a.taskbar_created.set(RegisterWindowMessageW(tb.as_ptr()));
             a.notify.set(opts.notify);
+            a.pal.set(Palette::detect());
             *a.sid.borrow_mut() = win::current_user_sid();
         });
 
@@ -143,11 +175,11 @@ fn main() {
             0,
             class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            860,
-            640,
+            820,
+            820,
             0,
             0,
             hinst,
@@ -158,7 +190,8 @@ fn main() {
         }
         // Size the (hidden) window for the monitor's DPI.
         let dpi = win::dpi_for_window(hwnd) as i32;
-        SetWindowPos(hwnd, 0, 0, 0, 860 * dpi / 96, 640 * dpi / 96, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hwnd, 0, 0, 0, 820 * dpi / 96, 820 * dpi / 96, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        apply_theme(hwnd);
 
         build_icons(hwnd);
         refresh(true);
@@ -169,6 +202,15 @@ fn main() {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            // Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+PgDn / Ctrl+PgUp switch tabs.
+            if msg.message == WM_KEYDOWN
+                && GetKeyState(VK_CONTROL) < 0
+                && matches!(msg.wParam, VK_TAB | VK_NEXT | VK_PRIOR)
+            {
+                let back = msg.wParam == VK_PRIOR || (msg.wParam == VK_TAB && GetKeyState(VK_SHIFT) < 0);
+                cycle_tab(back);
+                continue;
+            }
             if IsDialogMessageW(hwnd, &mut msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -251,21 +293,23 @@ fn refresh(force_text: bool) {
     let snap: Snapshot = status::collect(sid.as_deref());
     let body = status::report_body(&snap);
     let tip = status::tooltip(&snap);
+    let light = snap.light;
+    let headline = snap.headline.clone();
 
-    let (prev, changed, notify) = APP.with(|a| {
-        let prev = a.light.replace(Some(snap.light));
+    let (prev, changed, notify, hwnd) = APP.with(|a| {
+        let prev = a.light.replace(Some(light));
         *a.tip.borrow_mut() = tip;
         let changed = *a.body.borrow() != body;
         if changed {
             *a.body.borrow_mut() = body;
         }
-        (prev, changed, a.notify.get())
+        *a.snapshot.borrow_mut() = Some(snap);
+        *a.generated.borrow_mut() = win::now_string();
+        (prev, changed, a.notify.get(), a.hwnd.get())
     });
 
-    let balloon_text;
-    let balloon = if notify && snap.light == Light::Red && prev != Some(Light::Red) {
-        balloon_text = snap.headline.clone();
-        Some(("FSLogix problem detected", balloon_text.as_str(), NIIF_ERROR))
+    let balloon = if notify && light == Light::Red && prev != Some(Light::Red) {
+        Some(("FSLogix problem detected", headline.as_str(), NIIF_ERROR))
     } else {
         None
     };
@@ -274,20 +318,100 @@ fn refresh(force_text: bool) {
     if changed || force_text {
         update_text();
     }
+    unsafe {
+        if hwnd != 0 && IsWindowVisible(hwnd) != 0 {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
 }
 
 fn full_report() -> String {
     APP.with(|a| status::report(&a.body.borrow(), &a.extra.borrow()))
 }
 
+/// Push the latest data into the native child controls (report text + details list).
 fn update_text() {
-    let (hwnd, edit) = APP.with(|a| (a.hwnd.get(), a.edit.get()));
+    let (hwnd, edit, list) = APP.with(|a| (a.hwnd.get(), a.edit.get(), a.list.get()));
     if edit == 0 || unsafe { IsWindowVisible(hwnd) } == 0 {
         return;
     }
     let text = wide(&full_report());
     unsafe {
         SetWindowTextW(edit, text.as_ptr());
+    }
+    let rows = APP.with(|a| a.snapshot.borrow().as_ref().map(detail_rows));
+    if let Some(rows) = rows {
+        fill_list(list, &rows);
+    }
+}
+
+fn detail_rows(sn: &Snapshot) -> Vec<[String; 3]> {
+    let mut rows: Vec<[String; 3]> = Vec::new();
+    let mut push = |a: &str, b: &str, c: String| rows.push([a.to_string(), b.to_string(), c]);
+    push("Session", "Computer", sn.computer.clone());
+    push("Session", "User", sn.user.clone());
+    push("Session", "SID", sn.sid.clone().unwrap_or_else(|| "<unknown>".into()));
+    if let Some(id) = sn.session {
+        push("Session", "Session ID", id.to_string());
+    }
+    push("Session", "Overall", format!("[{}] {}", sn.light.word(), sn.headline));
+    for (sec, c) in [("Profile", &sn.profile), ("Office (ODFC)", &sn.odfc)] {
+        push(sec, "State", format!("[{}] {}", c.light.word(), c.summary));
+        push(sec, "Session key", c.session_path.clone().unwrap_or_else(|| "not found".into()));
+        for (n, v) in &c.values {
+            push(sec, n, v.clone());
+        }
+    }
+    for comp in &sn.components {
+        push(
+            "Component",
+            comp.name,
+            format!(
+                "{}  \u{00b7}  {}  \u{00b7}  {}",
+                win::service_state_text(&comp.state),
+                comp.version.as_deref().unwrap_or("-"),
+                comp.display
+            ),
+        );
+    }
+    push("Component", "Install path", status::apps_dir().display().to_string());
+    for sub in ["Profile", "ODFC"] {
+        push(
+            "Log",
+            &format!("{sub} log"),
+            status::newest_log(sub).map_or("none found".into(), |p| p.display().to_string()),
+        );
+    }
+    rows
+}
+
+fn fill_list(list: HWND, rows: &[[String; 3]]) {
+    if list == 0 {
+        return;
+    }
+    unsafe {
+        SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
+        for (i, row) in rows.iter().enumerate() {
+            let mut texts: Vec<Vec<u16>> = row.iter().map(|t| wide(t)).collect();
+            let mut item: LVITEMW = std::mem::zeroed();
+            item.mask = LVIF_TEXT;
+            item.iItem = i as i32;
+            item.iSubItem = 0;
+            item.pszText = texts[0].as_mut_ptr();
+            let idx = SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const LVITEMW as LPARAM);
+            if idx < 0 {
+                continue;
+            }
+            for (sub, t) in texts.iter_mut().enumerate().skip(1) {
+                let mut si: LVITEMW = std::mem::zeroed();
+                si.iSubItem = sub as i32;
+                si.pszText = t.as_mut_ptr();
+                SendMessageW(list, LVM_SETITEMTEXTW, idx as WPARAM, &si as *const LVITEMW as LPARAM);
+            }
+        }
+        for col in 0..3 {
+            SendMessageW(list, LVM_SETCOLUMNWIDTH, col, LVSCW_AUTOSIZE_USEHEADER);
+        }
     }
 }
 
@@ -298,13 +422,87 @@ fn show_window() {
         SetForegroundWindow(hwnd);
     }
     refresh(true);
-    let edit = APP.with(|a| a.edit.get());
+    sync_children();
+}
+
+// ------------------------------------------------------------------ tabs
+
+fn set_tab(tab: usize) {
+    let tab = tab % view::TAB_COUNT;
+    let hwnd = APP.with(|a| {
+        a.tab.set(tab);
+        a.hwnd.get()
+    });
+    sync_children();
     unsafe {
-        SetFocus(edit);
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
+fn cycle_tab(back: bool) {
+    let t = APP.with(|a| a.tab.get());
+    let n = view::TAB_COUNT;
+    set_tab(if back { (t + n - 1) % n } else { (t + 1) % n });
+}
+
+/// Show only the native control that belongs to the current tab, and focus it.
+fn sync_children() {
+    let (tab, edit, list) = APP.with(|a| (a.tab.get(), a.edit.get(), a.list.get()));
+    unsafe {
+        ShowWindow(list, if tab == view::TAB_DETAILS { SW_SHOW } else { SW_HIDE });
+        ShowWindow(edit, if tab == view::TAB_REPORT { SW_SHOW } else { SW_HIDE });
+        match tab {
+            view::TAB_DETAILS => {
+                SetFocus(list);
+            }
+            view::TAB_REPORT => {
+                SetFocus(edit);
+            }
+            _ => {
+                let first = APP.with(|a| a.buttons.borrow().first().copied().unwrap_or(0));
+                if first != 0 {
+                    SetFocus(first);
+                }
+            }
+        }
     }
 }
 
 // ------------------------------------------------------------------ window
+
+fn apply_theme(hwnd: HWND) {
+    let pal = Palette::detect();
+    let (edit, list, tooltip, buttons, old_brush) = APP.with(|a| {
+        a.pal.set(pal);
+        (a.edit.get(), a.list.get(), a.tooltip.get(), a.buttons.borrow().clone(), a.ctl_brush.get())
+    });
+    unsafe {
+        let dark: BOOL = pal.dark as BOOL;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const BOOL as *const _, 4);
+        let theme = wide(if pal.dark { "DarkMode_Explorer" } else { "Explorer" });
+        for h in [edit, list, tooltip] {
+            if h != 0 {
+                SetWindowTheme(h, theme.as_ptr(), null());
+            }
+        }
+        if list != 0 {
+            SendMessageW(list, LVM_SETBKCOLOR, 0, colorref(pal.card) as LPARAM);
+            SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, colorref(pal.card) as LPARAM);
+            SendMessageW(list, LVM_SETTEXTCOLOR, 0, colorref(pal.text) as LPARAM);
+        }
+        let brush = CreateSolidBrush(colorref(pal.card));
+        APP.with(|a| a.ctl_brush.set(brush));
+        if old_brush != 0 {
+            DeleteObject(old_brush);
+        }
+        InvalidateRect(hwnd, null(), 0);
+        for h in buttons.into_iter().chain([edit, list]) {
+            if h != 0 {
+                InvalidateRect(h, null(), 1);
+            }
+        }
+    }
+}
 
 fn make_fonts(hwnd: HWND) {
     let dpi = win::dpi_for_window(hwnd) as i32;
@@ -317,12 +515,15 @@ fn make_fonts(hwnd: HWND) {
             CreateFontW(height, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, ui.as_ptr()),
         )
     };
-    let (old_m, old_u, edit, buttons) = APP.with(|a| {
-        (a.font_mono.replace(fm), a.font_ui.replace(fu), a.edit.get(), a.buttons.borrow().clone())
+    let (old_m, old_u, edit, list, buttons) = APP.with(|a| {
+        (a.font_mono.replace(fm), a.font_ui.replace(fu), a.edit.get(), a.list.get(), a.buttons.borrow().clone())
     });
     unsafe {
         if edit != 0 {
             SendMessageW(edit, WM_SETFONT, fm as usize, 1);
+        }
+        if list != 0 {
+            SendMessageW(list, WM_SETFONT, fu as usize, 1);
         }
         for b in buttons {
             SendMessageW(b, WM_SETFONT, fu as usize, 1);
@@ -339,14 +540,15 @@ fn make_fonts(hwnd: HWND) {
 fn create_controls(hwnd: HWND) {
     let hinst = unsafe { GetModuleHandleW(null()) };
     let edit_class = wide("EDIT");
+    let list_class = wide("SysListView32");
     let button_class = wide("BUTTON");
     let empty = wide("");
     unsafe {
         let edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             edit_class.as_ptr(),
             empty.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
+            WS_CHILD | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
             0,
             0,
             100,
@@ -357,6 +559,33 @@ fn create_controls(hwnd: HWND) {
             null(),
         );
         SendMessageW(edit, EM_SETLIMITTEXT, 0, 0); // remove 32K limit
+
+        let list = CreateWindowExW(
+            0,
+            list_class.as_ptr(),
+            empty.as_ptr(),
+            WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+            0,
+            0,
+            100,
+            100,
+            hwnd,
+            ID_LIST as HMENU,
+            hinst,
+            null(),
+        );
+        let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
+        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as WPARAM, ex);
+        for (i, (title, width)) in [("Section", 110), ("Name", 200), ("Value", 400)].iter().enumerate() {
+            let mut t = wide(title);
+            let mut col: LVCOLUMNW = std::mem::zeroed();
+            col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            col.cx = *width;
+            col.pszText = t.as_mut_ptr();
+            col.iSubItem = i as i32;
+            SendMessageW(list, LVM_INSERTCOLUMNW, i, &col as *const LVCOLUMNW as LPARAM);
+        }
+
         let mut buttons = Vec::new();
         for (id, label) in BUTTONS {
             let l = wide(label);
@@ -364,7 +593,7 @@ fn create_controls(hwnd: HWND) {
                 0,
                 button_class.as_ptr(),
                 l.as_ptr(),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 0,
                 0,
                 10,
@@ -376,39 +605,175 @@ fn create_controls(hwnd: HWND) {
             );
             buttons.push(b);
         }
+        let tip_class = wide("tooltips_class32");
+        let tooltip = CreateWindowExW(
+            WS_EX_TOPMOST,
+            tip_class.as_ptr(),
+            null(),
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            hwnd,
+            0,
+            hinst,
+            null(),
+        );
+        if tooltip != 0 {
+            let dpi = win::dpi_for_window(hwnd) as isize;
+            SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 700 * dpi / 96); // wrap very long values
+            SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30_000); // keep it up long enough to read
+        }
         APP.with(|a| {
             a.hwnd.set(hwnd);
             a.edit.set(edit);
+            a.list.set(list);
+            a.tooltip.set(tooltip);
             *a.buttons.borrow_mut() = buttons;
         });
     }
     make_fonts(hwnd);
 }
 
+fn client_size(hwnd: HWND) -> (i32, i32) {
+    let mut rc = RECT::default();
+    unsafe { GetClientRect(hwnd, &mut rc) };
+    (rc.right, rc.bottom)
+}
+
 fn layout(hwnd: HWND) {
-    let (edit, buttons) = APP.with(|a| (a.edit.get(), a.buttons.borrow().clone()));
+    let (edit, list, buttons) = APP.with(|a| (a.edit.get(), a.list.get(), a.buttons.borrow().clone()));
     if edit == 0 {
         return;
     }
-    let dpi = win::dpi_for_window(hwnd) as i32;
-    let sc = |v: i32| v * dpi / 96;
-    let mut rc = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut rc) };
-    let (w, h) = (rc.right, rc.bottom);
-    let m = sc(8);
-    let bh = sc(28);
-    let bw = sc(104);
+    let dpi = win::dpi_for_window(hwnd);
+    let (w, h) = client_size(hwnd);
+    let geo = view::geometry(w as f32, h as f32, dpi);
+    let r = geo.inner;
     unsafe {
-        MoveWindow(edit, m, m, (w - 2 * m).max(10), (h - 3 * m - bh).max(10), 1);
-        let y = h - m - bh;
-        let n = buttons.len() as i32;
+        for c in [edit, list] {
+            MoveWindow(c, r.x as i32, r.y as i32, r.w as i32, r.h as i32, 1);
+        }
+        let bw = geo.button_w as i32;
+        let bh = geo.button_h as i32;
+        let y = geo.buttons_y as i32;
+        let gap = (8.0 * geo.s) as i32;
+        let n = buttons.len();
         for (i, b) in buttons.iter().enumerate() {
-            let i = i as i32;
             // last button (Close) is right-aligned, the rest left-aligned
-            let x = if i == n - 1 { w - m - bw } else { m + i * (bw + sc(6)) };
+            let x = if i == n - 1 { w - geo.pad as i32 - bw } else { geo.pad as i32 + i as i32 * (bw + gap) };
             MoveWindow(*b, x, y, bw, bh, 1);
         }
+        InvalidateRect(hwnd, null(), 0);
     }
+}
+
+/// Double-buffered GDI+ painting into `hdc`.
+fn paint_buffered(hdc: HDC, w: i32, h: i32, draw: impl FnOnce(&Graphics)) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, bmp);
+        if let Some(g) = Graphics::from_hdc(mem) {
+            draw(&g);
+            // g is dropped here, which flushes GDI+ before the blit
+        }
+        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+    }
+}
+
+fn on_paint(hwnd: HWND) {
+    unsafe {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let (w, h) = client_size(hwnd);
+        let dpi = win::dpi_for_window(hwnd);
+        let mut out = view::PaintOut::default();
+        paint_buffered(hdc, w, h, |g| {
+            out = APP.with(|a| {
+                let snap = a.snapshot.borrow();
+                let generated = a.generated.borrow();
+                let data = view::ViewData { snap: snap.as_ref(), generated: &generated, tab: a.tab.get(), pal: a.pal.get() };
+                view::paint(g, w as f32, h as f32, dpi, &data)
+            });
+        });
+        APP.with(|a| *a.tab_rects.borrow_mut() = out.tabs);
+        EndPaint(hwnd, &ps);
+        sync_tooltips(hwnd, out.hovers);
+    }
+}
+
+/// One tooltip area per cut-off value. Only rebuilt when the areas or texts change,
+/// so the 10-second refresh doesn't close a tooltip the user is reading.
+fn sync_tooltips(hwnd: HWND, hovers: Vec<(RectF, String)>) {
+    let (tooltip, old_count, same) = APP.with(|a| (a.tooltip.get(), a.tool_count.get(), *a.hovers.borrow() == hovers));
+    if tooltip == 0 || same {
+        return;
+    }
+    unsafe {
+        for id in 1..=old_count {
+            let mut ti: TTTOOLINFOW = std::mem::zeroed();
+            ti.cbSize = TTTOOLINFOW_V2_SIZE;
+            ti.hwnd = hwnd;
+            ti.uId = id;
+            SendMessageW(tooltip, TTM_DELTOOLW, 0, &ti as *const TTTOOLINFOW as LPARAM);
+        }
+        let hinst = GetModuleHandleW(null());
+        for (i, (r, text)) in hovers.iter().enumerate() {
+            let mut t = wide(text);
+            let mut ti: TTTOOLINFOW = std::mem::zeroed();
+            ti.cbSize = TTTOOLINFOW_V2_SIZE;
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = hwnd;
+            ti.uId = i + 1;
+            ti.rect = RECT {
+                left: r.x as i32,
+                top: r.y as i32,
+                right: r.right().ceil() as i32,
+                bottom: r.bottom().ceil() as i32,
+            };
+            ti.hinst = hinst;
+            ti.lpszText = t.as_mut_ptr(); // the tooltip copies the text
+            SendMessageW(tooltip, TTM_ADDTOOLW, 0, &ti as *const TTTOOLINFOW as LPARAM);
+        }
+    }
+    APP.with(|a| {
+        a.tool_count.set(hovers.len());
+        *a.hovers.borrow_mut() = hovers;
+    });
+}
+
+fn on_draw_item(hwnd: HWND, di: &DRAWITEMSTRUCT) {
+    let id = di.CtlID as usize;
+    let label = BUTTONS.iter().find(|(i, _)| *i == id).map_or("", |(_, l)| l);
+    let pal = APP.with(|a| a.pal.get());
+    let w = di.rcItem.right - di.rcItem.left;
+    let h = di.rcItem.bottom - di.rcItem.top;
+    let dpi = win::dpi_for_window(hwnd);
+    paint_buffered(di.hDC, w, h, |g| {
+        view::button(
+            g,
+            w as f32,
+            h as f32,
+            dpi,
+            label,
+            id == ID_REFRESH,
+            di.itemState & ODS_SELECTED != 0,
+            di.itemState & ODS_FOCUS != 0 && di.itemState & ODS_NOFOCUSRECT == 0,
+            &pal,
+        );
+    });
+}
+
+fn tab_at(x: f32, y: f32) -> Option<usize> {
+    APP.with(|a| a.tab_rects.borrow().iter().position(|r| r.contains(x, y)))
 }
 
 fn show_menu(hwnd: HWND) {
@@ -466,6 +831,7 @@ fn open_log(hwnd: HWND, sub: &str) {
 fn start_redirects(hwnd: HWND) {
     APP.with(|a| *a.extra.borrow_mut() = "=== frx.exe list-redirects ===\r\nRunning…".into());
     show_window();
+    set_tab(view::TAB_REPORT);
     std::thread::spawn(move || {
         let exe = status::apps_dir().join("frx.exe");
         let mut cmd = std::process::Command::new(&exe);
@@ -522,7 +888,7 @@ fn command(hwnd: HWND, id: usize) {
         ID_ABOUT => win::message_box(
             hwnd,
             &format!(
-                "{APP_NAME} {}\n\nLightweight FSLogix profile status tray tool.\nA community replacement for the retired frxtray.exe.\n\nNot affiliated with or supported by Microsoft.",
+                "{APP_NAME} {}\n\nLightweight FSLogix profile status tray tool.\nA community replacement for the retired frxtray.exe.\n\nKeyboard: Ctrl+Tab switches tabs, Esc closes the window.\n\nNot affiliated with or supported by Microsoft.",
                 env!("CARGO_PKG_VERSION")
             ),
             APP_NAME,
@@ -538,6 +904,10 @@ fn command(hwnd: HWND, id: usize) {
     }
 }
 
+fn lparam_xy(lp: LPARAM) -> (f32, f32) {
+    ((lp & 0xFFFF) as u16 as i16 as f32, ((lp >> 16) & 0xFFFF) as u16 as i16 as f32)
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -547,6 +917,57 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_SIZE => {
             layout(hwnd);
             0
+        }
+        WM_ERASEBKGND => 1, // everything is painted in WM_PAINT
+        WM_PAINT => {
+            on_paint(hwnd);
+            0
+        }
+        WM_DRAWITEM => {
+            if lp != 0 {
+                on_draw_item(hwnd, &*(lp as *const DRAWITEMSTRUCT));
+            }
+            1
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+            let (edit, pal, brush) = APP.with(|a| (a.edit.get(), a.pal.get(), a.ctl_brush.get()));
+            if lp == edit && brush != 0 {
+                SetTextColor(wp as HDC, colorref(pal.text));
+                SetBkColor(wp as HDC, colorref(pal.card));
+                return brush;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = lparam_xy(lp);
+            if let Some(t) = tab_at(x, y) {
+                set_tab(t);
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            if wp as HWND == hwnd && (lp & 0xFFFF) == HTCLIENT {
+                let mut pt = POINT::default();
+                GetCursorPos(&mut pt);
+                ScreenToClient(hwnd, &mut pt);
+                if tab_at(pt.x as f32, pt.y as f32).is_some() {
+                    SetCursor(LoadCursorW(0, IDC_HAND as *const u16));
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_GETMINMAXINFO => {
+            if lp != 0 {
+                let dpi = win::dpi_for_window(hwnd) as i32;
+                let mmi = &mut *(lp as *mut MINMAXINFO);
+                mmi.ptMinTrackSize = POINT { x: 700 * dpi / 96, y: 620 * dpi / 96 };
+            }
+            0
+        }
+        WM_SETTINGCHANGE => {
+            apply_theme(hwnd);
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_DPICHANGED => {
             let r = &*(lp as *const RECT);
@@ -595,12 +1016,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             tray(NIM_DELETE, None);
-            let (fm, fu) = APP.with(|a| (a.font_mono.replace(0), a.font_ui.replace(0)));
-            if fm != 0 {
-                DeleteObject(fm);
-            }
-            if fu != 0 {
-                DeleteObject(fu);
+            let (fm, fu, br) = APP.with(|a| (a.font_mono.replace(0), a.font_ui.replace(0), a.ctl_brush.replace(0)));
+            for h in [fm, fu, br] {
+                if h != 0 {
+                    DeleteObject(h);
+                }
             }
             PostQuitMessage(0);
             0

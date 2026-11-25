@@ -1,6 +1,6 @@
 [package]
 name = "avdtray"
-version = "0.1.1"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.77"
 description = "Lightweight FSLogix profile status tray tool - a replacement for the retired frxtray.exe"
