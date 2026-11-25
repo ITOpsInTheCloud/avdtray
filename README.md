@@ -1,5 +1,8 @@
 # AVD Tray
 
+<img width="804" height="781" alt="avdtray-0 2 0-preview" src="https://github.com/user-attachments/assets/99528080-a120-43b2-95e5-07ce6c5bd96e" />
+
+
 A lightweight, open replacement for **frxtray.exe**, the FSLogix Profile Status tray tool that Microsoft deprecated on 22 Aug 2023 and removed from FSLogix 25.02 (retired 11 Feb 2025).
 
 * Single native `avdtray.exe` (~400–700 KB), written in Rust on the raw Win32 API
